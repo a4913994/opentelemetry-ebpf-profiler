@@ -7,7 +7,6 @@ import (
 	"context"
 	"maps"
 	"slices"
-	"strconv"
 	"time"
 
 	lru "github.com/elastic/go-freelru"
@@ -284,10 +283,10 @@ func (r *CollectorReporter) setProfile(profile pprofile.Profile) (startTS,
 	funcMap := make(map[funcInfo]uint64)
 	funcMap[funcInfo{name: "", fileName: ""}] = 0
 
-	// attributeMap is a temporary helper that maps attribute values to
+	// attrMap is a temporary helper that maps attribute values to
 	// their respective indices.
 	// This is to ensure that AttributeTable does not contain duplicates.
-	attributeMap := make(map[string]uint64)
+	attrMap := make(attributeMap)
 
 	st := profile.SampleType().AppendEmpty()
 	st.SetType(int64(getStringMapIndex(stringMap, "samples")))
@@ -319,9 +318,9 @@ func (r *CollectorReporter) setProfile(profile pprofile.Profile) (startTS,
 
 		// Walk every frame of the trace.
 		for i := range traceInfo.frameTypes {
-			frameAttributes := addPdataProfileAttributes(profile, []attrKeyValue[string]{
+			frameAttributes := addProfileAttributes(profile.AttributeTable(), []attrKeyValue[string]{
 				{key: "profile.frame.type", value: traceInfo.frameTypes[i].String()},
-			}, attributeMap)
+			}, attrMap)
 
 			loc := profile.Location().AppendEmpty()
 			loc.SetAddress(uint64(traceInfo.linenos[i]))
@@ -349,14 +348,14 @@ func (r *CollectorReporter) setProfile(profile pprofile.Profile) (startTS,
 						fileName = ei.fileName
 					}
 
-					mappingAttributes := addPdataProfileAttributes(profile, []attrKeyValue[string]{
+					mappingAttributes := addProfileAttributes(profile.AttributeTable(), []attrKeyValue[string]{
 						// Once SemConv and its Go package is released with the new
 						// semantic convention for build_id, replace these hard coded
 						// strings.
 						{key: "process.executable.build_id.gnu", value: ei.gnuBuildID},
 						{key: "process.executable.build_id.htlhash",
 							value: traceInfo.files[i].StringNoQuotes()},
-					}, attributeMap)
+					}, attrMap)
 
 					mapping := profile.Mapping().AppendEmpty()
 					mapping.SetMemoryStart(uint64(traceInfo.mappingStarts[i]))
@@ -406,13 +405,13 @@ func (r *CollectorReporter) setProfile(profile pprofile.Profile) (startTS,
 			}
 		}
 
-		sampleAttrs := append(addPdataProfileAttributes(profile, []attrKeyValue[string]{
+		sampleAttrs := append(addProfileAttributes(profile.AttributeTable(), []attrKeyValue[string]{
 			{key: string(semconv.ContainerIDKey), value: traceKey.containerID},
 			{key: string(semconv.ThreadNameKey), value: traceKey.comm},
 			{key: string(semconv.ServiceNameKey), value: traceKey.apmServiceName},
-		}, attributeMap), addPdataProfileAttributes(profile, []attrKeyValue[int64]{
+		}, attrMap), addProfileAttributes(profile.AttributeTable(), []attrKeyValue[int64]{
 			{key: string(semconv.ProcessPIDKey), value: traceKey.pid},
-		}, attributeMap)...)
+		}, attrMap)...)
 
 		sample.Attributes().FromRaw(sampleAttrs)
 
@@ -472,46 +471,6 @@ func (r *CollectorReporter) reportProfile(ctx context.Context) error {
 	}
 
 	return r.nextConsumer.ConsumeProfiles(ctx, profiles)
-}
-
-// addPdataProfileAttributes adds attributes to Profile.attribute_table and returns
-// the indices to these attributes.
-func addPdataProfileAttributes[T string | int64](profile pprofile.Profile,
-	attributes []attrKeyValue[T], attributeMap map[string]uint64) []uint64 {
-	indices := make([]uint64, 0, len(attributes))
-
-	addAttr := func(attr attrKeyValue[T]) {
-		var attributeCompositeKey string
-		var attributeValue string
-
-		switch val := any(attr.value).(type) {
-		case string:
-			attributeCompositeKey = attr.key + "_" + val
-			attributeValue = val
-		case int64:
-			strVal := strconv.FormatInt(val, 10)
-			attributeCompositeKey = attr.key + "_" + strVal
-			attributeValue = strVal
-		default:
-			log.Error("Unsupported attribute value type. Only string and int64 are supported.")
-			return
-		}
-
-		if attributeIndex, exists := attributeMap[attributeCompositeKey]; exists {
-			indices = append(indices, attributeIndex)
-			return
-		}
-		newIndex := uint64(profile.AttributeTable().Len())
-		indices = append(indices, newIndex)
-		profile.AttributeTable().PutStr(attr.key, attributeValue)
-		attributeMap[attributeCompositeKey] = newIndex
-	}
-
-	for i := range attributes {
-		addAttr(attributes[i])
-	}
-
-	return indices
 }
 
 // getDummyPdataMappingIndex inserts or looks up an entry for interpreted FileIDs.

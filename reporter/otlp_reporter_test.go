@@ -30,26 +30,8 @@ func TestGetSampleAttributes(t *testing.T) {
 				},
 			},
 			attributeMap:    make(map[string]uint64),
-			expectedIndices: [][]uint64{{0, 1, 2, 3}},
+			expectedIndices: [][]uint64{{0}},
 			expectedAttributeTable: []*common.KeyValue{
-				{
-					Key: "container.id",
-					Value: &common.AnyValue{
-						Value: &common.AnyValue_StringValue{StringValue: ""},
-					},
-				},
-				{
-					Key: "thread.name",
-					Value: &common.AnyValue{
-						Value: &common.AnyValue_StringValue{StringValue: ""},
-					},
-				},
-				{
-					Key: "service.name",
-					Value: &common.AnyValue{
-						Value: &common.AnyValue_StringValue{StringValue: ""},
-					},
-				},
 				{
 					Key: "process.pid",
 					Value: &common.AnyValue{
@@ -184,13 +166,13 @@ func TestGetSampleAttributes(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			indices := make([][]uint64, 0)
 			for _, k := range tc.k {
-				indices = append(indices, append(addProfileAttributes(tc.profile,
+				indices = append(indices, append(addProfileAttributes(getAttrTableWrapper(tc.profile),
 					[]attrKeyValue[string]{
 						{key: string(semconv.ContainerIDKey), value: k.containerID},
 						{key: string(semconv.ThreadNameKey), value: k.comm},
 						{key: string(semconv.ServiceNameKey), value: k.apmServiceName},
 					}, tc.attributeMap),
-					addProfileAttributes(tc.profile,
+					addProfileAttributes(getAttrTableWrapper(tc.profile),
 						[]attrKeyValue[int64]{
 							{key: string(semconv.ProcessPIDKey), value: k.pid},
 						}, tc.attributeMap)...))
