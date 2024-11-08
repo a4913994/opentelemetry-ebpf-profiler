@@ -175,38 +175,7 @@ func (r *OTLPReporter) SupportsReportTraceEvent() bool { return true }
 
 // ReportTraceEvent enqueues reported trace events for the OTLP reporter.
 func (r *OTLPReporter) ReportTraceEvent(trace *libpf.Trace, meta *TraceEventMeta) {
-	traceEventsMap := r.traceEvents.WLock()
-	defer r.traceEvents.WUnlock(&traceEventsMap)
-
-	containerID, err := lookupCgroupv2(r.cgroupv2ID, meta.PID)
-	if err != nil {
-		log.Debugf("Failed to get a cgroupv2 ID as container ID for PID %d: %v",
-			meta.PID, err)
-	}
-
-	key := traceAndMetaKey{
-		hash:           trace.Hash,
-		comm:           meta.Comm,
-		apmServiceName: meta.APMServiceName,
-		containerID:    containerID,
-		pid:            int64(meta.PID),
-	}
-
-	if events, exists := (*traceEventsMap)[key]; exists {
-		events.timestamps = append(events.timestamps, uint64(meta.Timestamp))
-		(*traceEventsMap)[key] = events
-		return
-	}
-
-	(*traceEventsMap)[key] = &traceEvents{
-		files:              trace.Files,
-		linenos:            trace.Linenos,
-		frameTypes:         trace.FrameTypes,
-		mappingStarts:      trace.MappingStart,
-		mappingEnds:        trace.MappingEnd,
-		mappingFileOffsets: trace.MappingFileOffsets,
-		timestamps:         []uint64{uint64(meta.Timestamp)},
-	}
+	reportTraceEvent(r.traceEvents, r.cgroupv2ID, trace, meta)
 }
 
 // ReportFramesForTrace is a NOP for OTLPReporter.
