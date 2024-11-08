@@ -9,10 +9,12 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"time"
 
 	lru "github.com/elastic/go-freelru"
 	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
+	"go.opentelemetry.io/ebpf-profiler/libpf/xsync"
 )
 
 var (
@@ -20,6 +22,47 @@ var (
 )
 
 type cgroupv2IDCache = *lru.SyncedLRU[libpf.PID, string]
+type hostmetadataCache = *lru.SyncedLRU[string, string]
+type executablesCache = *lru.SyncedLRU[libpf.FileID, execInfo]
+type traceEventsCache = *xsync.RWMutex[map[traceAndMetaKey]*traceEvents]
+type framesCache = *lru.SyncedLRU[libpf.FileID, *xsync.RWMutex[map[libpf.AddressOrLineno]sourceInfo]]
+
+func getReporterCaches(cfg *Config) (executablesCache, framesCache, cgroupv2IDCache, hostmetadataCache, traceEventsCache, error) {
+	executables, err :=
+		lru.NewSynced[libpf.FileID, execInfo](cfg.ExecutablesCacheElements, libpf.FileID.Hash32)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+	executables.SetLifetime(1 * time.Hour) // Allow GC to clean stale items.
+
+	frames, err := lru.NewSynced[libpf.FileID,
+		*xsync.RWMutex[map[libpf.AddressOrLineno]sourceInfo]](
+		cfg.FramesCacheElements, libpf.FileID.Hash32)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+	frames.SetLifetime(1 * time.Hour) // Allow GC to clean stale items.
+
+	cgroupv2ID, err := lru.NewSynced[libpf.PID, string](cfg.CGroupCacheElements,
+		func(pid libpf.PID) uint32 { return uint32(pid) })
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+	// Set a lifetime to reduce risk of invalid data in case of PID reuse.
+	cgroupv2ID.SetLifetime(90 * time.Second)
+
+	// Next step: Dynamically configure the size of this LRU.
+	// Currently, we use the length of the JSON array in
+	// hostmetadata/hostmetadata.json.
+	hostmetadata, err := lru.NewSynced[string, string](115, hashString)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+
+	traceEvents := xsync.NewRWMutex(map[traceAndMetaKey]*traceEvents{})
+
+	return executables, frames, cgroupv2ID, hostmetadata, &traceEvents, nil
+}
 
 // lookupCgroupv2 returns the cgroupv2 ID for pid.
 func lookupCgroupv2(cgroupv2ID cgroupv2IDCache, pid libpf.PID) (string, error) {

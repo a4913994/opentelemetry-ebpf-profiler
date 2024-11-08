@@ -9,7 +9,6 @@ import (
 	"slices"
 	"time"
 
-	lru "github.com/elastic/go-freelru"
 	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/collector/consumer/consumerprofiles"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -32,19 +31,19 @@ type CollectorReporter struct {
 	stopSignal chan struct{}
 
 	// hostmetadata stores metadata that is sent out with every request.
-	hostmetadata *lru.SyncedLRU[string, string]
+	hostmetadata hostmetadataCache
 
 	// executables stores metadata for executables.
-	executables *lru.SyncedLRU[libpf.FileID, execInfo]
+	executables executablesCache
 
 	// cgroupv2ID caches PID to container ID information for cgroupv2 containers.
 	cgroupv2ID cgroupv2IDCache
 
 	// frames maps frame information to its source location.
-	frames *lru.SyncedLRU[libpf.FileID, *xsync.RWMutex[map[libpf.AddressOrLineno]sourceInfo]]
+	frames framesCache
 
 	// traceEvents stores reported trace events (trace metadata with frames and counts)
-	traceEvents xsync.RWMutex[map[traceAndMetaKey]*traceEvents]
+	traceEvents traceEventsCache
 
 	// samplesPerSecond is the number of samples per second.
 	samplesPerSecond int
@@ -52,33 +51,7 @@ type CollectorReporter struct {
 
 // NewCollector builds a new CollectorReporter
 func NewCollector(cfg *Config, nextConsumer consumerprofiles.Profiles) (*CollectorReporter, error) {
-	executables, err :=
-		lru.NewSynced[libpf.FileID, execInfo](cfg.ExecutablesCacheElements, libpf.FileID.Hash32)
-	if err != nil {
-		return nil, err
-	}
-	executables.SetLifetime(1 * time.Hour) // Allow GC to clean stale items.
-
-	frames, err := lru.NewSynced[libpf.FileID,
-		*xsync.RWMutex[map[libpf.AddressOrLineno]sourceInfo]](
-		cfg.FramesCacheElements, libpf.FileID.Hash32)
-	if err != nil {
-		return nil, err
-	}
-	frames.SetLifetime(1 * time.Hour) // Allow GC to clean stale items.
-
-	cgroupv2ID, err := lru.NewSynced[libpf.PID, string](cfg.CGroupCacheElements,
-		func(pid libpf.PID) uint32 { return uint32(pid) })
-	if err != nil {
-		return nil, err
-	}
-	// Set a lifetime to reduce risk of invalid data in case of PID reuse.
-	cgroupv2ID.SetLifetime(90 * time.Second)
-
-	// Next step: Dynamically configure the size of this LRU.
-	// Currently, we use the length of the JSON array in
-	// hostmetadata/hostmetadata.json.
-	hostmetadata, err := lru.NewSynced[string, string](115, hashString)
+	executables, frames, cgroupv2ID, hostmetadata, traceEvents, err := getReporterCaches(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +63,7 @@ func NewCollector(cfg *Config, nextConsumer consumerprofiles.Profiles) (*Collect
 		executables:  executables,
 		frames:       frames,
 		hostmetadata: hostmetadata,
-		traceEvents:  xsync.NewRWMutex(map[traceAndMetaKey]*traceEvents{}),
+		traceEvents:  traceEvents,
 		cgroupv2ID:   cgroupv2ID,
 
 		samplesPerSecond: cfg.SamplesPerSecond,
