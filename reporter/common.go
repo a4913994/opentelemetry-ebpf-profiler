@@ -162,3 +162,41 @@ func addProfileAttributes[T string | int64](p profileAttributeHandler,
 
 	return indices
 }
+
+// addFrameMetadata accepts metadata associated witha a frame and caches it.
+func addFrameMetadata(frames framesCache, args *FrameMetadataArgs) {
+	fileID := args.FrameID.FileID()
+	addressOrLine := args.FrameID.AddressOrLine()
+
+	if frameMapLock, exists := frames.Get(fileID); exists {
+		frameMap := frameMapLock.WLock()
+		defer frameMapLock.WUnlock(&frameMap)
+
+		sourceFile := args.SourceFile
+		if sourceFile == "" {
+			// The new SourceFile may be empty, and we don't want to overwrite
+			// an existing filePath with it.
+			if s, exists := (*frameMap)[addressOrLine]; exists {
+				sourceFile = s.filePath
+			}
+		}
+
+		(*frameMap)[addressOrLine] = sourceInfo{
+			lineNumber:     args.SourceLine,
+			filePath:       sourceFile,
+			functionOffset: args.FunctionOffset,
+			functionName:   args.FunctionName,
+		}
+		return
+	}
+
+	v := make(map[libpf.AddressOrLineno]sourceInfo)
+	v[addressOrLine] = sourceInfo{
+		lineNumber:     args.SourceLine,
+		filePath:       args.SourceFile,
+		functionOffset: args.FunctionOffset,
+		functionName:   args.FunctionName,
+	}
+	mu := xsync.NewRWMutex(v)
+	frames.Add(fileID, &mu)
+}
