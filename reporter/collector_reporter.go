@@ -184,13 +184,13 @@ func (r *CollectorReporter) setProfile(profile pprofile.Profile) (startTS,
 
 	// stringMap is a temporary helper that will build the StringTable.
 	// By specification, the first element should be empty.
-	stringMap := make(map[string]uint32)
-	stringMap[""] = 0
+	strMap := make(stringMap)
+	strMap[""] = 0
 
 	// funcMap is a temporary helper that will build the Function array
 	// in profile and make sure information is deduplicated.
-	funcMap := make(map[funcInfo]uint64)
-	funcMap[funcInfo{name: "", fileName: ""}] = 0
+	fnMap := make(funcMap)
+	fnMap[funcInfo{name: "", fileName: ""}] = 0
 
 	// attrMap is a temporary helper that maps attribute values to
 	// their respective indices.
@@ -198,24 +198,21 @@ func (r *CollectorReporter) setProfile(profile pprofile.Profile) (startTS,
 	attrMap := make(attributeMap)
 
 	st := profile.SampleType().AppendEmpty()
-	st.SetType(int64(getStringMapIndex(stringMap, "samples")))
-	st.SetUnit(int64(getStringMapIndex(stringMap, "count")))
+	st.SetType(int64(getStringMapIndex(strMap, "samples")))
+	st.SetUnit(int64(getStringMapIndex(strMap, "count")))
 
 	pt := profile.PeriodType()
-	pt.SetType(int64(getStringMapIndex(stringMap, "cpu")))
-	pt.SetUnit(int64(getStringMapIndex(stringMap, "nanoseconds")))
+	pt.SetType(int64(getStringMapIndex(strMap, "cpu")))
+	pt.SetUnit(int64(getStringMapIndex(strMap, "nanoseconds")))
 	profile.SetPeriod(1e9 / int64(r.samplesPerSecond))
 
 	locationIndex := uint64(0)
-
-	// Temporary lookup to reference existing Mappings.
-	fileIDtoMapping := make(map[libpf.FileID]uint64)
 
 	for traceKey, traceInfo := range samples {
 		sample := profile.Sample().AppendEmpty()
 		sample.SetLocationsStartIndex(locationIndex)
 
-		sample.SetStacktraceIdIndex(getStringMapIndex(stringMap,
+		sample.SetStacktraceIdIndex(getStringMapIndex(strMap,
 			traceKey.hash.Base64()))
 
 		slices.Sort(traceInfo.timestamps)
@@ -225,94 +222,9 @@ func (r *CollectorReporter) setProfile(profile pprofile.Profile) (startTS,
 		sample.TimestampsUnixNano().FromRaw(traceInfo.timestamps)
 		sample.Value().Append(1)
 
-		// Walk every frame of the trace.
-		for i := range traceInfo.frameTypes {
-			frameAttributes := addProfileAttributes(profile.AttributeTable(), []attrKeyValue[string]{
-				{key: "profile.frame.type", value: traceInfo.frameTypes[i].String()},
-			}, attrMap)
-
-			loc := profile.Location().AppendEmpty()
-			loc.SetAddress(uint64(traceInfo.linenos[i]))
-			loc.Attributes().FromRaw(frameAttributes)
-
-			switch frameKind := traceInfo.frameTypes[i]; frameKind {
-			case libpf.NativeFrame:
-				// As native frames are resolved in the backend, we use Mapping to
-				// report these frames.
-
-				var locationMappingIndex uint64
-				if tmpMappingIndex, exists := fileIDtoMapping[traceInfo.files[i]]; exists {
-					locationMappingIndex = tmpMappingIndex
-				} else {
-					idx := uint64(len(fileIDtoMapping))
-					fileIDtoMapping[traceInfo.files[i]] = idx
-					locationMappingIndex = idx
-
-					ei, exists := r.executables.Get(traceInfo.files[i])
-
-					// Next step: Select a proper default value,
-					// if the name of the executable is not known yet.
-					var fileName = "UNKNOWN"
-					if exists {
-						fileName = ei.fileName
-					}
-
-					mappingAttributes := addProfileAttributes(profile.AttributeTable(), []attrKeyValue[string]{
-						// Once SemConv and its Go package is released with the new
-						// semantic convention for build_id, replace these hard coded
-						// strings.
-						{key: "process.executable.build_id.gnu", value: ei.gnuBuildID},
-						{key: "process.executable.build_id.htlhash",
-							value: traceInfo.files[i].StringNoQuotes()},
-					}, attrMap)
-
-					mapping := profile.Mapping().AppendEmpty()
-					mapping.SetMemoryStart(uint64(traceInfo.mappingStarts[i]))
-					mapping.SetMemoryLimit(uint64(traceInfo.mappingEnds[i]))
-					mapping.SetFileOffset(traceInfo.mappingFileOffsets[i])
-					mapping.SetFilename(int64(getStringMapIndex(stringMap, fileName)))
-					mapping.Attributes().FromRaw(mappingAttributes)
-				}
-				loc.SetMappingIndex(locationMappingIndex)
-			case libpf.AbortFrame:
-				// Next step: Figure out how the OTLP protocol
-				// could handle artificial frames, like AbortFrame,
-				// that are not originated from a native or interpreted
-				// program.
-			default:
-				// Store interpreted frame information as a Line message:
-				line := loc.Line().AppendEmpty()
-
-				fileIDInfoLock, exists := r.frames.Get(traceInfo.files[i])
-				if !exists {
-					// At this point, we do not have enough information for the frame.
-					// Therefore, we report a dummy entry and use the interpreter as filename.
-					line.SetFunctionIndex(createFunctionEntry(funcMap,
-						"UNREPORTED", frameKind.String()))
-				} else {
-					fileIDInfo := fileIDInfoLock.RLock()
-					if si, exists := (*fileIDInfo)[traceInfo.linenos[i]]; exists {
-						line.SetLine(int64(si.lineNumber))
-
-						line.SetFunctionIndex(createFunctionEntry(funcMap,
-							si.functionName, si.filePath))
-					} else {
-						// At this point, we do not have enough information for the frame.
-						// Therefore, we report a dummy entry and use the interpreter as filename.
-						// To differentiate this case from the case where no information about
-						// the file ID is available at all, we use a different name for reported
-						// function.
-						line.SetFunctionIndex(createFunctionEntry(funcMap,
-							"UNRESOLVED", frameKind.String()))
-					}
-					fileIDInfoLock.RUnlock(&fileIDInfo)
-				}
-
-				// To be compliant with the protocol, generate a dummy mapping entry.
-				loc.SetMappingIndex(getDummyPdataMappingIndex(fileIDtoMapping, stringMap,
-					profile, traceInfo.files[i]))
-			}
-		}
+		populateTrace(profile.AttributeTable(), getpdataMappingHandlerWrapper(profile.Mapping()),
+			getpdataLocationHandlingWrapper(profile.Location()),
+			r.executables, r.frames, traceInfo, strMap, fnMap, attrMap)
 
 		sampleAttrs := append(addProfileAttributes(profile.AttributeTable(), []attrKeyValue[string]{
 			{key: string(semconv.ContainerIDKey), value: traceKey.containerID},
@@ -330,17 +242,17 @@ func (r *CollectorReporter) setProfile(profile pprofile.Profile) (startTS,
 	log.Debugf("Reporting OTLP profile with %d samples", profile.Sample().Len())
 
 	// Populate the deduplicated functions into profile.
-	for v := range funcMap {
+	for v := range fnMap {
 		f := profile.Function().AppendEmpty()
-		f.SetName(int64(getStringMapIndex(stringMap, v.name)))
-		f.SetFilename(int64(getStringMapIndex(stringMap, v.fileName)))
+		f.SetName(int64(getStringMapIndex(strMap, v.name)))
+		f.SetFilename(int64(getStringMapIndex(strMap, v.fileName)))
 	}
 
 	// When ranging over stringMap, the order will be according to the
 	// hash value of the key. To get the correct order for profile.StringTable,
 	// put the values in stringMap, in the correct array order.
-	stringTable := make([]string, len(stringMap))
-	for v, idx := range stringMap {
+	stringTable := make([]string, len(strMap))
+	for v, idx := range strMap {
 		stringTable[idx] = v
 	}
 
@@ -382,18 +294,58 @@ func (r *CollectorReporter) reportProfile(ctx context.Context) error {
 	return r.nextConsumer.ConsumeProfiles(ctx, profiles)
 }
 
-// getDummyPdataMappingIndex inserts or looks up an entry for interpreted FileIDs.
-func getDummyPdataMappingIndex(fileIDtoMapping map[libpf.FileID]uint64,
-	stringMap map[string]uint32, profile pprofile.Profile,
-	fileID libpf.FileID) uint64 {
-	if mappingIndex, exists := fileIDtoMapping[fileID]; exists {
-		return mappingIndex
+var _ mappingHandler = (*collectorMappingWrapper)(nil)
+
+type collectorMappingWrapper struct {
+	pprofile.Profile
+}
+
+func (p *collectorMappingWrapper) Add(memStart, memLimit, fileOffset uint64, fileNameIdx int64, attrIndices []uint64) {
+	mapping := p.Mapping().AppendEmpty()
+	mapping.SetMemoryStart(memStart)
+	mapping.SetMemoryLimit(memLimit)
+	mapping.SetFileOffset(fileOffset)
+	mapping.SetFilename(fileNameIdx)
+	mapping.Attributes().FromRaw(attrIndices)
+}
+
+var _ mappingHandler = (*pdataMappingWrapper)(nil)
+
+type pdataMappingWrapper struct {
+	pprofile.MappingSlice
+}
+
+func getpdataMappingHandlerWrapper(p pprofile.MappingSlice) *pdataMappingWrapper {
+	return &pdataMappingWrapper{p}
+}
+
+func (w *pdataMappingWrapper) Add(memStart, memLimit, fileOffset uint64, fileNameIdx int64, attrIndices []uint64) {
+	mapping := w.AppendEmpty()
+	mapping.SetMemoryStart(memStart)
+	mapping.SetMemoryLimit(memLimit)
+	mapping.SetFileOffset(fileOffset)
+	mapping.SetFilename(fileNameIdx)
+	mapping.Attributes().FromRaw(attrIndices)
+}
+
+var _ locationHandler = (*pdataLocationWrapper)(nil)
+
+type pdataLocationWrapper struct {
+	pprofile.LocationSlice
+}
+
+func getpdataLocationHandlingWrapper(p pprofile.LocationSlice) *pdataLocationWrapper {
+	return &pdataLocationWrapper{p}
+}
+
+func (w *pdataLocationWrapper) Add(address uint64, mapping uint64, attributes []uint64, ll *locLine) {
+	loc := w.AppendEmpty()
+	loc.SetAddress(address)
+	loc.Attributes().FromRaw(attributes)
+	loc.SetMappingIndex(mapping)
+	if ll != nil {
+		line := loc.Line().AppendEmpty()
+		line.SetFunctionIndex(ll.fnIdx)
+		line.SetLine(ll.line)
 	}
-
-	locationMappingIndex := uint64(len(fileIDtoMapping))
-	fileIDtoMapping[fileID] = locationMappingIndex
-
-	mapping := profile.Mapping().AppendEmpty()
-	mapping.SetFilename(int64(getStringMapIndex(stringMap, "")))
-	return locationMappingIndex
 }

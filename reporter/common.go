@@ -105,6 +105,19 @@ func lookupCgroupv2(cgroupv2ID cgroupv2IDCache, pid libpf.PID) (string, error) {
 	return genericCgroupv2, nil
 }
 
+type locLine struct {
+	fnIdx uint64
+	line  int64
+}
+
+type locationHandler interface {
+	Add(address uint64, mapping uint64, attributes []uint64, line *locLine)
+}
+
+type mappingHandler interface {
+	Add(memStart, memLimit, fileOffset uint64, fileNameIdx int64, attrIndices []uint64)
+}
+
 // profileAttributeHandler provides a generic way to add attributes to a map.
 type profileAttributeHandler interface {
 	PutStr(key string, value string)
@@ -115,6 +128,12 @@ type profileAttributeHandler interface {
 // attributeMap is a temporary cache to hold attribute key to index into
 // an attribute table mappings.
 type attributeMap map[string]uint64
+
+// stringMap ...
+type stringMap map[string]uint32
+
+// funcMap ...
+type funcMap map[funcInfo]uint64
 
 // addProfileAttributes adds attributes to Profile.attribute_table and returns
 // the indices to these attributes.
@@ -235,4 +254,137 @@ func reportTraceEvent(traceEventsCache traceEventsCache, cgroupv2ID cgroupv2IDCa
 		mappingFileOffsets: trace.MappingFileOffsets,
 		timestamps:         []uint64{uint64(meta.Timestamp)},
 	}
+}
+
+func populateTrace(attrHandler profileAttributeHandler,
+	mH mappingHandler, locH locationHandler,
+	exeCache executablesCache, framesCache framesCache,
+	traceInfo *traceEvents,
+	strMap stringMap, fnMap funcMap, attrMap attributeMap) {
+	// Temporary lookup to reference existing Mappings.
+	fileIDtoMapping := make(map[libpf.FileID]uint64)
+
+	// Walk every frame of the trace.
+	for i := range traceInfo.frameTypes {
+		frameAttributes := addProfileAttributes(attrHandler, []attrKeyValue[string]{
+			{key: "profile.frame.type", value: traceInfo.frameTypes[i].String()},
+		}, attrMap)
+
+		var locationMappingIndex uint64
+		var ll *locLine
+
+		switch frameKind := traceInfo.frameTypes[i]; frameKind {
+		case libpf.NativeFrame:
+			// As native frames are resolved in the backend, we use Mapping to
+			// report these frames.
+
+			if tmpMappingIndex, exists := fileIDtoMapping[traceInfo.files[i]]; exists {
+				locationMappingIndex = tmpMappingIndex
+			} else {
+				idx := uint64(len(fileIDtoMapping))
+				fileIDtoMapping[traceInfo.files[i]] = idx
+				locationMappingIndex = idx
+
+				execInfo, exists := exeCache.Get(traceInfo.files[i])
+
+				// Next step: Select a proper default value,
+				// if the name of the executable is not known yet.
+				var fileName = "UNKNOWN"
+				if exists {
+					fileName = execInfo.fileName
+				}
+
+				mappingAttributes := addProfileAttributes(attrHandler, []attrKeyValue[string]{
+					// Once SemConv and its Go package is released with the new
+					// semantic convention for build_id, replace these hard coded
+					// strings.
+					{key: "process.executable.build_id.gnu", value: execInfo.gnuBuildID},
+					{key: "process.executable.build_id.profiling",
+						value: traceInfo.files[i].StringNoQuotes()},
+				}, attrMap)
+
+				mH.Add(uint64(traceInfo.mappingStarts[i]), uint64(traceInfo.mappingEnds[i]),
+					traceInfo.mappingFileOffsets[i], int64(getStringMapIndex(strMap, fileName)),
+					mappingAttributes)
+			}
+		case libpf.AbortFrame:
+			// Next step: Figure out how the OTLP protocol
+			// could handle artificial frames, like AbortFrame,
+			// that are not originated from a native or interpreted
+			// program.
+		default:
+			fileIDInfoLock, exists := framesCache.Get(traceInfo.files[i])
+			if !exists {
+				// At this point, we do not have enough information for the frame.
+				// Therefore, we report a dummy entry and use the interpreter as filename.
+				ll = &locLine{
+					fnIdx: createFunctionEntry(fnMap, "UNREPORTED", frameKind.String()),
+				}
+			} else {
+				fileIDInfo := fileIDInfoLock.RLock()
+				if si, exists := (*fileIDInfo)[traceInfo.linenos[i]]; exists {
+					ll = &locLine{
+						fnIdx: createFunctionEntry(fnMap, si.functionName, si.filePath),
+						line:  int64(si.lineNumber),
+					}
+				} else {
+					// At this point, we do not have enough information for the frame.
+					// Therefore, we report a dummy entry and use the interpreter as filename.
+					// To differentiate this case from the case where no information about
+					// the file ID is available at all, we use a different name for reported
+					// function.
+					ll = &locLine{
+						fnIdx: createFunctionEntry(fnMap, "UNRESOLVED", frameKind.String()),
+					}
+				}
+				fileIDInfoLock.RUnlock(&fileIDInfo)
+			}
+
+			// To be compliant with the protocol, generate a dummy mapping entry.
+			locationMappingIndex = getDummyMappingIndex(fileIDtoMapping, strMap,
+				mH, traceInfo.files[i])
+		}
+		locH.Add(uint64(traceInfo.linenos[i]), locationMappingIndex, frameAttributes, ll)
+	}
+}
+
+// getDummyMappingIndex inserts or looks up an entry for interpreted FileIDs.
+func getDummyMappingIndex(fileIDtoMapping map[libpf.FileID]uint64,
+	strMap stringMap, mH mappingHandler, fileID libpf.FileID) uint64 {
+	if tmpMappingIndex, exists := fileIDtoMapping[fileID]; exists {
+		return tmpMappingIndex
+	}
+	idx := uint64(len(fileIDtoMapping))
+	fileIDtoMapping[fileID] = idx
+
+	mH.Add(0, 0, 0, int64(getStringMapIndex(strMap, "")), []uint64{})
+	return idx
+}
+
+// getStringMapIndex inserts or looks up the index for value in stringMap.
+func getStringMapIndex(strMap stringMap, value string) uint32 {
+	if idx, exists := strMap[value]; exists {
+		return idx
+	}
+
+	idx := uint32(len(strMap))
+	strMap[value] = idx
+
+	return idx
+}
+
+// createFunctionEntry adds a new function and returns its reference index.
+func createFunctionEntry(fnMap funcMap, name string, fileName string) uint64 {
+	key := funcInfo{
+		name:     name,
+		fileName: fileName,
+	}
+	if idx, exists := fnMap[key]; exists {
+		return idx
+	}
+
+	idx := uint64(len(fnMap))
+	fnMap[key] = idx
+
+	return idx
 }

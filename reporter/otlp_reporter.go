@@ -409,13 +409,13 @@ func (r *OTLPReporter) getProfile() (profile *profiles.Profile, startTS, endTS u
 
 	// stringMap is a temporary helper that will build the StringTable.
 	// By specification, the first element should be empty.
-	stringMap := make(map[string]uint32)
-	stringMap[""] = 0
+	strMap := make(stringMap)
+	strMap[""] = 0
 
 	// funcMap is a temporary helper that will build the Function array
 	// in profile and make sure information is deduplicated.
-	funcMap := make(map[funcInfo]uint64)
-	funcMap[funcInfo{name: "", fileName: ""}] = 0
+	fnMap := make(funcMap)
+	fnMap[funcInfo{name: "", fileName: ""}] = 0
 
 	// attrMap is a temporary helper that maps attribute values to
 	// their respective indices.
@@ -427,12 +427,12 @@ func (r *OTLPReporter) getProfile() (profile *profiles.Profile, startTS, endTS u
 		// SampleType - Next step: Figure out the correct SampleType.
 		Sample: make([]*profiles.Sample, 0, numSamples),
 		SampleType: []*profiles.ValueType{{
-			Type: int64(getStringMapIndex(stringMap, "samples")),
-			Unit: int64(getStringMapIndex(stringMap, "count")),
+			Type: int64(getStringMapIndex(strMap, "samples")),
+			Unit: int64(getStringMapIndex(strMap, "count")),
 		}},
 		PeriodType: &profiles.ValueType{
-			Type: int64(getStringMapIndex(stringMap, "cpu")),
-			Unit: int64(getStringMapIndex(stringMap, "nanoseconds")),
+			Type: int64(getStringMapIndex(strMap, "cpu")),
+			Unit: int64(getStringMapIndex(strMap, "nanoseconds")),
 		},
 		Period: 1e9 / int64(r.samplesPerSecond),
 		// AttributeUnits - Optional element we do not use.
@@ -445,14 +445,11 @@ func (r *OTLPReporter) getProfile() (profile *profiles.Profile, startTS, endTS u
 
 	locationIndex := uint64(0)
 
-	// Temporary lookup to reference existing Mappings.
-	fileIDtoMapping := make(map[libpf.FileID]uint64)
-
 	for traceKey, traceInfo := range samples {
 		sample := &profiles.Sample{}
 		sample.LocationsStartIndex = locationIndex
 
-		sample.StacktraceIdIndex = getStringMapIndex(stringMap,
+		sample.StacktraceIdIndex = getStringMapIndex(strMap,
 			traceKey.hash.Base64())
 
 		slices.Sort(traceInfo.timestamps)
@@ -462,105 +459,10 @@ func (r *OTLPReporter) getProfile() (profile *profiles.Profile, startTS, endTS u
 		sample.TimestampsUnixNano = traceInfo.timestamps
 		sample.Value = []int64{1}
 
-		// Walk every frame of the trace.
-		for i := range traceInfo.frameTypes {
-			frameAttributes := addProfileAttributes(getAttrTableWrapper(profile), []attrKeyValue[string]{
-				{key: "profile.frame.type", value: traceInfo.frameTypes[i].String()},
-			}, attrMap)
-
-			loc := &profiles.Location{
-				// Id - Optional element we do not use.
-				Address: uint64(traceInfo.linenos[i]),
-				// IsFolded - Optional element we do not use.
-				Attributes: frameAttributes,
-			}
-
-			switch frameKind := traceInfo.frameTypes[i]; frameKind {
-			case libpf.NativeFrame:
-				// As native frames are resolved in the backend, we use Mapping to
-				// report these frames.
-
-				var locationMappingIndex uint64
-				if tmpMappingIndex, exists := fileIDtoMapping[traceInfo.files[i]]; exists {
-					locationMappingIndex = tmpMappingIndex
-				} else {
-					idx := uint64(len(fileIDtoMapping))
-					fileIDtoMapping[traceInfo.files[i]] = idx
-					locationMappingIndex = idx
-
-					execInfo, exists := r.executables.Get(traceInfo.files[i])
-
-					// Next step: Select a proper default value,
-					// if the name of the executable is not known yet.
-					var fileName = "UNKNOWN"
-					if exists {
-						fileName = execInfo.fileName
-					}
-
-					mappingAttributes := addProfileAttributes(getAttrTableWrapper(profile), []attrKeyValue[string]{
-						// Once SemConv and its Go package is released with the new
-						// semantic convention for build_id, replace these hard coded
-						// strings.
-						{key: "process.executable.build_id.gnu", value: execInfo.gnuBuildID},
-						{key: "process.executable.build_id.profiling",
-							value: traceInfo.files[i].StringNoQuotes()},
-					}, attrMap)
-
-					profile.Mapping = append(profile.Mapping, &profiles.Mapping{
-						// Id - Optional element we do not use.
-						MemoryStart: uint64(traceInfo.mappingStarts[i]),
-						MemoryLimit: uint64(traceInfo.mappingEnds[i]),
-						FileOffset:  traceInfo.mappingFileOffsets[i],
-						Filename:    int64(getStringMapIndex(stringMap, fileName)),
-						Attributes:  mappingAttributes,
-						// HasFunctions - Optional element we do not use.
-						// HasFilenames - Optional element we do not use.
-						// HasLineNumbers - Optional element we do not use.
-						// HasInlinedFrames - Optional element we do not use.
-					})
-				}
-				loc.MappingIndex = locationMappingIndex
-			case libpf.AbortFrame:
-				// Next step: Figure out how the OTLP protocol
-				// could handle artificial frames, like AbortFrame,
-				// that are not originated from a native or interpreted
-				// program.
-			default:
-				// Store interpreted frame information as a Line message:
-				line := &profiles.Line{}
-
-				fileIDInfoLock, exists := r.frames.Get(traceInfo.files[i])
-				if !exists {
-					// At this point, we do not have enough information for the frame.
-					// Therefore, we report a dummy entry and use the interpreter as filename.
-					line.FunctionIndex = createFunctionEntry(funcMap,
-						"UNREPORTED", frameKind.String())
-				} else {
-					fileIDInfo := fileIDInfoLock.RLock()
-					if si, exists := (*fileIDInfo)[traceInfo.linenos[i]]; exists {
-						line.Line = int64(si.lineNumber)
-
-						line.FunctionIndex = createFunctionEntry(funcMap,
-							si.functionName, si.filePath)
-					} else {
-						// At this point, we do not have enough information for the frame.
-						// Therefore, we report a dummy entry and use the interpreter as filename.
-						// To differentiate this case from the case where no information about
-						// the file ID is available at all, we use a different name for reported
-						// function.
-						line.FunctionIndex = createFunctionEntry(funcMap,
-							"UNRESOLVED", frameKind.String())
-					}
-					fileIDInfoLock.RUnlock(&fileIDInfo)
-				}
-				loc.Line = append(loc.Line, line)
-
-				// To be compliant with the protocol, generate a dummy mapping entry.
-				loc.MappingIndex = getDummyMappingIndex(fileIDtoMapping, stringMap,
-					profile, traceInfo.files[i])
-			}
-			profile.Location = append(profile.Location, loc)
-		}
+		populateTrace(getAttrTableWrapper(profile),
+			getMappingHandlerWrapper(profile),
+			getLocationHandlingWrapper(profile),
+			r.executables, r.frames, traceInfo, strMap, fnMap, attrMap)
 
 		sample.Attributes = append(addProfileAttributes(getAttrTableWrapper(profile), []attrKeyValue[string]{
 			{key: string(semconv.ContainerIDKey), value: traceKey.containerID},
@@ -577,11 +479,11 @@ func (r *OTLPReporter) getProfile() (profile *profiles.Profile, startTS, endTS u
 	log.Debugf("Reporting OTLP profile with %d samples", len(profile.Sample))
 
 	// Populate the deduplicated functions into profile.
-	funcTable := make([]*profiles.Function, len(funcMap))
-	for v, idx := range funcMap {
+	funcTable := make([]*profiles.Function, len(fnMap))
+	for v, idx := range fnMap {
 		funcTable[idx] = &profiles.Function{
-			Name:     int64(getStringMapIndex(stringMap, v.name)),
-			Filename: int64(getStringMapIndex(stringMap, v.fileName)),
+			Name:     int64(getStringMapIndex(strMap, v.name)),
+			Filename: int64(getStringMapIndex(strMap, v.fileName)),
 		}
 	}
 	profile.Function = append(profile.Function, funcTable...)
@@ -589,8 +491,8 @@ func (r *OTLPReporter) getProfile() (profile *profiles.Profile, startTS, endTS u
 	// When ranging over stringMap, the order will be according to the
 	// hash value of the key. To get the correct order for profile.StringTable,
 	// put the values in stringMap, in the correct array order.
-	stringTable := make([]string, len(stringMap))
-	for v, idx := range stringMap {
+	stringTable := make([]string, len(strMap))
+	for v, idx := range strMap {
 		stringTable[idx] = v
 	}
 	profile.StringTable = append(profile.StringTable, stringTable...)
@@ -606,57 +508,6 @@ func (r *OTLPReporter) getProfile() (profile *profiles.Profile, startTS, endTS u
 	profile.TimeNanos = int64(startTS)
 
 	return profile, startTS, endTS
-}
-
-// getStringMapIndex inserts or looks up the index for value in stringMap.
-func getStringMapIndex(stringMap map[string]uint32, value string) uint32 {
-	if idx, exists := stringMap[value]; exists {
-		return idx
-	}
-
-	idx := uint32(len(stringMap))
-	stringMap[value] = idx
-
-	return idx
-}
-
-// createFunctionEntry adds a new function and returns its reference index.
-func createFunctionEntry(funcMap map[funcInfo]uint64,
-	name string, fileName string) uint64 {
-	key := funcInfo{
-		name:     name,
-		fileName: fileName,
-	}
-	if idx, exists := funcMap[key]; exists {
-		return idx
-	}
-
-	idx := uint64(len(funcMap))
-	funcMap[key] = idx
-
-	return idx
-}
-
-// getDummyMappingIndex inserts or looks up an entry for interpreted FileIDs.
-func getDummyMappingIndex(fileIDtoMapping map[libpf.FileID]uint64,
-	stringMap map[string]uint32, profile *profiles.Profile,
-	fileID libpf.FileID) uint64 {
-	var locationMappingIndex uint64
-	if tmpMappingIndex, exists := fileIDtoMapping[fileID]; exists {
-		locationMappingIndex = tmpMappingIndex
-	} else {
-		idx := uint64(len(fileIDtoMapping))
-		fileIDtoMapping[fileID] = idx
-		locationMappingIndex = idx
-
-		profile.Mapping = append(profile.Mapping, &profiles.Mapping{
-			Filename: int64(getStringMapIndex(stringMap, "")),
-			BuildId: int64(getStringMapIndex(stringMap,
-				fileID.StringNoQuotes())),
-			BuildIdKind: *profiles.BuildIdKind_BUILD_ID_BINARY_HASH.Enum(),
-		})
-	}
-	return locationMappingIndex
 }
 
 // waitGrpcEndpoint waits until the gRPC connection is established.
@@ -752,4 +603,56 @@ func (w *attrTableWrapper) PutInt(key string, value int64) {
 			Value: &common.AnyValue_IntValue{
 				IntValue: value}},
 	})
+}
+
+var _ mappingHandler = (*otlpMappingWrapper)(nil)
+
+type otlpMappingWrapper struct {
+	*profiles.Profile
+}
+
+func getMappingHandlerWrapper(p *profiles.Profile) *otlpMappingWrapper {
+	return &otlpMappingWrapper{p}
+}
+
+func (w *otlpMappingWrapper) Add(memStart, memLimit, fileOffset uint64, fileNameIdx int64, attrIndices []uint64) {
+	w.Mapping = append(w.Mapping, &profiles.Mapping{
+		// Id - Optional element we do not use.
+		MemoryStart: memStart,
+		MemoryLimit: memLimit,
+		FileOffset:  fileOffset,
+		Filename:    fileNameIdx,
+		Attributes:  attrIndices,
+		// HasFunctions - Optional element we do not use.
+		// HasFilenames - Optional element we do not use.
+		// HasLineNumbers - Optional element we do not use.
+		// HasInlinedFrames - Optional element we do not use.
+	})
+}
+
+var _ locationHandler = (*otlpLocationWrapper)(nil)
+
+type otlpLocationWrapper struct {
+	*profiles.Profile
+}
+
+func getLocationHandlingWrapper(p *profiles.Profile) *otlpLocationWrapper {
+	return &otlpLocationWrapper{p}
+}
+
+func (w *otlpLocationWrapper) Add(address uint64, mapping uint64, attributes []uint64, line *locLine) {
+	loc := &profiles.Location{
+		// Id - Optional element we do not use.
+		Address: address,
+		// IsFolded - Optional element we do not use.
+		Attributes:   attributes,
+		MappingIndex: mapping,
+	}
+	if line != nil {
+		loc.Line = append(loc.Line, &profiles.Line{
+			FunctionIndex: line.fnIdx,
+			Line:          line.line,
+		})
+	}
+	w.Location = append(w.Location, loc)
 }
