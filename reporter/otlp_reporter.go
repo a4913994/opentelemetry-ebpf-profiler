@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"maps"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"time"
@@ -67,6 +68,8 @@ type traceAndMetaKey struct {
 	// containerID is annotated based on PID information
 	containerID string
 	pid         int64
+	// executable is retrieved from /proc/PID/exe
+	executable string
 }
 
 // traceEvents holds known information about a trace.
@@ -223,6 +226,7 @@ func (r *OTLPReporter) ReportTraceEvent(trace *libpf.Trace, meta *TraceEventMeta
 	key := traceAndMetaKey{
 		hash:           trace.Hash,
 		comm:           meta.Comm,
+		executable:     meta.Executable,
 		apmServiceName: meta.APMServiceName,
 		containerID:    containerID,
 		pid:            int64(meta.PID),
@@ -654,9 +658,14 @@ func (r *OTLPReporter) getProfile() (profile *profiles.Profile, startTS, endTS u
 			profile.Location = append(profile.Location, loc)
 		}
 
+		exePath := traceKey.executable
+		exeName := filepath.Base(exePath)
+
 		sample.Attributes = append(addProfileAttributes(profile, []attrKeyValue[string]{
 			{key: string(semconv.ContainerIDKey), value: traceKey.containerID},
 			{key: string(semconv.ThreadNameKey), value: traceKey.comm},
+			{key: string(semconv.ProcessExecutableNameKey), value: exeName},
+			{key: string(semconv.ProcessExecutablePathKey), value: exePath},
 			{key: string(semconv.ServiceNameKey), value: traceKey.apmServiceName},
 		}, attributeMap), addProfileAttributes(profile, []attrKeyValue[int64]{
 			{key: string(semconv.ProcessPIDKey), value: traceKey.pid},
